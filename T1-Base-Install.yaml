@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS DevOps Agent - Template 1: Base Install.
+  Creates the Agent Space, IAM roles, and Operator App (web console).
+  This is the foundation. Deploy this first. Optional add-ons
+  (webhook, secondary account, Slack) build on top of it.
+
+# =============================================================================
+# PARAMETERS - everything is an input, nothing hardcoded
+# =============================================================================
+Parameters:
+  AgentSpaceName:
+    Type: String
+    Description: Name for the DevOps Agent Space (e.g. my-devops-agent)
+    MinLength: 1
+    MaxLength: 255
+
+  AgentSpaceDescription:
+    Type: String
+    Default: DevOps Agent space deployed via CloudFormation
+    Description: A short description for the Agent Space
+    MaxLength: 1000
+
+  DenySensitiveReads:
+    Type: String
+    Default: 'No'
+    AllowedValues: ['Yes', 'No']
+    Description: >-
+      Yes = add a Deny policy so the agent can not read
+      SSM parameter values and Lambda / AppSync environment variables in this account.
+      See the Security section in the README.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: 'Agent Space'}
+        Parameters: [AgentSpaceName, AgentSpaceDescription, DenySensitiveReads]
+    ParameterLabels:
+      DenySensitiveReads: {default: Deny sensitive reads}
+      AgentSpaceName: {default: Agent Space Name}
+      AgentSpaceDescription: {default: Agent Space Description}
+
+Conditions:
+  AddSensitiveDeny: !Equals [!Ref DenySensitiveReads, 'Yes']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # IAM role the DevOps Agent service assumes to investigate this account.
+  # Mostly read access, but not only read. See the Security section in the README.
+  AgentSpaceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AgentSpaceName}-AgentSpaceRole'
+      Description: Allows DevOps Agent to read AWS resources for investigation
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy
+      Policies:
+        - PolicyName: AllowCreateServiceLinkedRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCreateServiceLinkedRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer
+
+  # Optional Deny for sensitive reads (only when DenySensitiveReads = Yes)
+  AgentSpaceRoleSensitiveDeny:
+    Type: AWS::IAM::RolePolicy
+    Condition: AddSensitiveDeny
+    Properties:
+      RoleName: !Ref AgentSpaceRole
+      PolicyName: DenySensitiveReads
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenySensitiveReads
+            Effect: Deny
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+              - lambda:GetFunctionConfiguration
+              - appsync:GetGraphqlApiEnvironmentVariables
+            Resource: '*'
+
+  # IAM role for the Operator App (web console access)
+  OperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AgentSpaceName}-OperatorRole'
+      Description: Allows users to access the DevOps Agent web console
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsOperatorAppAccessPolicy
+
+  # The Agent Space with the Operator App enabled
+  AgentSpace:
+    Type: AWS::DevOpsAgent::AgentSpace
+    DependsOn:
+      - AgentSpaceRole
+      - OperatorRole
+    Properties:
+      Name: !Ref AgentSpaceName
+      Description: !Ref AgentSpaceDescription
+      OperatorApp:
+        Iam:
+          OperatorAppRoleArn: !GetAtt OperatorRole.Arn
+
+  # AWS account association - lets the agent monitor THIS account
+  AwsMonitorAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Properties:
+      AgentSpaceId: !GetAtt AgentSpace.AgentSpaceId
+      ServiceId: aws
+      Configuration:
+        Aws:
+          AssumableRoleArn: !GetAtt AgentSpaceRole.Arn
+          AccountId: !Ref AWS::AccountId
+          AccountType: monitor
+
+# =============================================================================
+# OUTPUTS - exported so the add-on templates can import them automatically
+# =============================================================================
+Outputs:
+  AgentSpaceId:
+    Description: The Agent Space ID
+    Value: !GetAtt AgentSpace.AgentSpaceId
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentSpaceId'
+
+  AgentSpaceArn:
+    Description: The Agent Space ARN
+    Value: !GetAtt AgentSpace.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentSpaceArn'
+
+  AgentSpaceRoleArn:
+    Description: IAM role ARN the agent uses to monitor this account
+    Value: !GetAtt AgentSpaceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentSpaceRoleArn'
+
+  OperatorRoleArn:
+    Description: IAM role ARN for web console access
+    Value: !GetAtt OperatorRole.Arn
+
+  ConsoleUrl:
+    Description: DevOps Agent console URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/aidevops/home?region=${AWS::Region}'

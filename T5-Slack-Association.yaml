@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS DevOps Agent - Template 5: Slack Association (add-on).
+  Deploy this IN THE PRIMARY account AFTER connecting Slack via the console
+  OAuth flow (Agent Space > Integrations > Slack > Connect). The console
+  registers Slack and gives it a ServiceId (UUID). You pass that UUID here.
+  NOTE: The initial Slack OAuth cannot be automated - it is a one-time
+  browser step. This template manages the channel association after that.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  BaseStackName:
+    Type: String
+    Description: >-
+      The stack name of Template 1 (base install). Its exported Agent Space ID
+      is imported automatically.
+
+  SlackServiceId:
+    Type: String
+    Description: >-
+      The Slack service ID (UUID) created when you connected Slack in the
+      console. Find it with: aws devops-agent list-services --region <region>
+    MinLength: 1
+    MaxLength: 255
+
+  SlackWorkspaceId:
+    Type: String
+    Description: >-
+      Slack Workspace ID (starts with T or E, e.g. T01ABC23DEF).
+      In Slack: workspace name > Settings > About this workspace.
+    AllowedPattern: '^[TE][A-Z0-9]+$'
+    ConstraintDescription: Must start with T or E followed by uppercase letters/numbers
+
+  SlackWorkspaceName:
+    Type: String
+    Description: Slack workspace name (e.g. my-company)
+    MinLength: 1
+
+  SlackChannelId:
+    Type: String
+    Description: >-
+      Slack Channel ID for incident notifications (e.g. C01ABC23DEF).
+      Right-click the channel > View channel details > scroll to the bottom.
+    MinLength: 1
+
+  SlackChannelName:
+    Type: String
+    Description: Slack channel name (e.g. incidents-devops-agent)
+    MinLength: 1
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: 'Link to base install'}
+        Parameters: [BaseStackName]
+      - Label: {default: 'Slack service (from console OAuth)'}
+        Parameters: [SlackServiceId]
+      - Label: {default: 'Slack workspace and channel'}
+        Parameters: [SlackWorkspaceId, SlackWorkspaceName, SlackChannelId, SlackChannelName]
+    ParameterLabels:
+      BaseStackName: {default: Base Stack Name (Template 1)}
+      SlackServiceId: {default: Slack Service ID (UUID)}
+      SlackWorkspaceId: {default: Workspace ID}
+      SlackWorkspaceName: {default: Workspace Name}
+      SlackChannelId: {default: Channel ID}
+      SlackChannelName: {default: Channel Name}
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # Links a Slack channel to the Agent Space for incident notifications
+  SlackAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Properties:
+      AgentSpaceId:
+        Fn::ImportValue: !Sub '${BaseStackName}-AgentSpaceId'
+      ServiceId: !Ref SlackServiceId
+      Configuration:
+        Slack:
+          WorkspaceId: !Ref SlackWorkspaceId
+          WorkspaceName: !Ref SlackWorkspaceName
+          TransmissionTarget:
+            IncidentResponseTarget:
+              ChannelId: !Ref SlackChannelId
+              ChannelName: !Ref SlackChannelName
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  SlackAssociationId:
+    Description: The Slack association ID
+    Value: !GetAtt SlackAssociation.AssociationId
+
+  Status:
+    Description: Result
+    Value: !Sub 'Slack channel ${SlackChannelName} is now linked to the Agent Space'

@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS DevOps Agent - Template 4: Source Account Association (add-on).
+  Deploy this IN THE PRIMARY account (where the Agent Space runs), AFTER
+  Template 3 has created the role in the secondary account. It links the
+  secondary account to the Agent Space so the agent can investigate across
+  both accounts.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  BaseStackName:
+    Type: String
+    Description: >-
+      The stack name of Template 1 (base install). Its exported Agent Space ID
+      is imported automatically - no copy-paste needed.
+
+  ServiceAccountId:
+    Type: String
+    Description: The 12-digit AWS account ID of the SECONDARY account (Template 3 output)
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  ServiceAccountRoleArn:
+    Type: String
+    Description: >-
+      The cross-account role ARN from the secondary account
+      (Template 3 output "SecondaryAccountRoleArn").
+    AllowedPattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+    ConstraintDescription: Must be a valid IAM role ARN
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: 'Link to base install'}
+        Parameters: [BaseStackName]
+      - Label: {default: 'Secondary account'}
+        Parameters: [ServiceAccountId, ServiceAccountRoleArn]
+    ParameterLabels:
+      BaseStackName: {default: Base Stack Name (Template 1)}
+      ServiceAccountId: {default: Secondary Account ID}
+      ServiceAccountRoleArn: {default: Secondary Account Role ARN (from Template 3)}
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # Links the secondary account to the Agent Space as a monitored source
+  SourceAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Properties:
+      AgentSpaceId:
+        Fn::ImportValue: !Sub '${BaseStackName}-AgentSpaceId'
+      ServiceId: aws
+      Configuration:
+        SourceAws:
+          AccountId: !Ref ServiceAccountId
+          AccountType: source
+          AssumableRoleArn: !Ref ServiceAccountRoleArn
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  SourceAssociationId:
+    Description: The source association ID
+    Value: !GetAtt SourceAssociation.AssociationId
+
+  Status:
+    Description: Result
+    Value: !Sub 'Secondary account ${ServiceAccountId} is now a monitored source for the Agent Space'

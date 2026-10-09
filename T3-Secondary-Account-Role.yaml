@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS DevOps Agent - Template 3: Secondary Account Role (add-on).
+  Deploy this IN THE SECONDARY account you want the agent to monitor.
+  It creates the investigation IAM role that trusts one specific Agent
+  Space in your primary (monitoring) account. After this, deploy Template 4 in the primary
+  account to link the two.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  MonitoringAccountId:
+    Type: String
+    Description: The 12-digit AWS account ID of the PRIMARY account (where the Agent Space runs)
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  AgentSpaceArn:
+    Type: String
+    Description: >-
+      ARN of the Agent Space that may use this role. Take it from the
+      AgentSpaceArn output of the Template 1 stack in the primary account.
+    AllowedPattern: '^arn:aws[a-z-]*:aidevops:[a-z0-9-]+:[0-9]{12}:agentspace/.+$'
+    ConstraintDescription: Must be an Agent Space ARN (arn:aws:aidevops:<region>:<account>:agentspace/<id>)
+
+  DenySensitiveReads:
+    Type: String
+    Default: 'No'
+    AllowedValues: ['Yes', 'No']
+    Description: >-
+      Yes = add a Deny policy so the agent can not read
+      SSM parameter values and Lambda / AppSync environment variables in this account.
+      See the Security section in the README.
+
+  RoleName:
+    Type: String
+    Default: DevOpsAgentRole-SecondaryAccount
+    Description: Name for the cross-account IAM role created in this account
+    MinLength: 1
+    MaxLength: 64
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: 'Link to primary account'}
+        Parameters: [MonitoringAccountId, AgentSpaceArn]
+      - Label: {default: 'Role'}
+        Parameters: [RoleName, DenySensitiveReads]
+    ParameterLabels:
+      MonitoringAccountId: {default: Primary Account ID}
+      AgentSpaceArn: {default: Agent Space ARN (from Template 1 output)}
+      DenySensitiveReads: {default: Deny sensitive reads}
+      RoleName: {default: Cross-account Role Name}
+
+Conditions:
+  AddSensitiveDeny: !Equals [!Ref DenySensitiveReads, 'Yes']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # Investigation role trusted by ONE Agent Space in the primary account.
+  # Trust is pinned two ways:
+  #   1. aws:SourceAccount must equal the primary account ID
+  #   2. aws:SourceArn must equal the exact Agent Space ARN (no wildcard)
+  # The AWS managed policy AIDevOpsAgentAccessPolicy is mostly read access, but
+  # not only read. See the Security section in the README.
+  DevOpsSecondaryAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: !Sub 'Allows DevOps Agent (primary account ${MonitoringAccountId}) to read resources in this account'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref MonitoringAccountId
+                aws:SourceArn: !Ref AgentSpaceArn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy
+      Policies: !If
+        - AddSensitiveDeny
+        - - PolicyName: DenySensitiveReads
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: DenySensitiveReads
+                  Effect: Deny
+                  Action:
+                    - ssm:GetParameter
+                    - ssm:GetParameters
+                    - ssm:GetParametersByPath
+                    - lambda:GetFunctionConfiguration
+                    - appsync:GetGraphqlApiEnvironmentVariables
+                  Resource: '*'
+        - !Ref AWS::NoValue
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  SecondaryAccountRoleArn:
+    Description: Cross-account IAM role ARN. Pass this to Template 4 in the primary account.
+    Value: !GetAtt DevOpsSecondaryAccountRole.Arn
+
+  SecondaryAccountId:
+    Description: This (secondary) account ID. Pass this to Template 4.
+    Value: !Ref AWS::AccountId

@@ -1,0 +1,16 @@
+# OS / editor files
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local working notes and scan output (never commit)
+*.html
+PROJECT-STATUS.md
+*-results.txt
+scan-report*.json
+
+# Local secrets
+.env
+hmac-key.txt

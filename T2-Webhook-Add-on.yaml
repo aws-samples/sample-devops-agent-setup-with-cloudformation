@@ -1,0 +1,448 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS DevOps Agent - Template 2: Webhook + Alarm Pipeline (add-on).
+  Deploy this AFTER Template 1 (base install). It adds the
+  CloudWatch Alarm -> SNS -> Lambda -> DevOps Agent webhook pipeline.
+  The webhook itself is generated in the console (one-time). You store the
+  HMAC key in Secrets Manager yourself, then pass the webhook URL and the
+  secret ARN here. The key itself never goes on the command line.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  BaseStackName:
+    Type: String
+    Description: >-
+      The stack name you used for Template 1 (base install). This template
+      imports the Agent Space name and IDs that stack exported.
+
+  AgentSpaceName:
+    Type: String
+    Description: >-
+      Same Agent Space name you used in Template 1. Used to name the
+      SNS topic, Lambda, and related resources consistently.
+    MinLength: 1
+    MaxLength: 255
+
+  WebhookUrl:
+    Type: String
+    Description: >-
+      DevOps Agent webhook URL. Generate it in the console:
+      Agent Space > Capabilities > Webhook > Generate.
+    AllowedPattern: 'https://.*'
+    ConstraintDescription: Must be an https:// URL
+
+  HmacSecretArn:
+    Type: String
+    Description: >-
+      ARN of the Secrets Manager secret that holds the webhook HMAC key.
+      Create the secret first (see README), then pass only its ARN here.
+    AllowedPattern: '^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
+    ConstraintDescription: Must be a Secrets Manager secret ARN
+
+  HmacSecretKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. ARN of the customer managed KMS key that encrypts the HMAC secret.
+      Leave empty if the secret uses the default aws/secretsmanager key.
+
+  DlqAlarmActionArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. SNS topic ARN to notify when failed alarms land in the dead letter
+      queue (for example an ops email topic). Do NOT use the alarm topic of this stack.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: 'Link to base install'}
+        Parameters: [BaseStackName, AgentSpaceName]
+      - Label: {default: 'Webhook (from console)'}
+        Parameters: [WebhookUrl, HmacSecretArn, HmacSecretKmsKeyArn]
+      - Label: {default: 'Failure alerting (optional)'}
+        Parameters: [DlqAlarmActionArn]
+    ParameterLabels:
+      BaseStackName: {default: Base Stack Name (Template 1)}
+      AgentSpaceName: {default: Agent Space Name}
+      WebhookUrl: {default: Webhook URL}
+      HmacSecretArn: {default: HMAC Key Secret ARN}
+      HmacSecretKmsKeyArn: {default: HMAC Secret KMS Key ARN (optional)}
+      DlqAlarmActionArn: {default: DLQ Alarm Action ARN (optional)}
+
+Conditions:
+  HasSecretKmsKey: !Not [!Equals [!Ref HmacSecretKmsKeyArn, '']]
+  HasDlqAlarmAction: !Not [!Equals [!Ref DlqAlarmActionArn, '']]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # KMS key that encrypts the SNS topic and the DLQ
+  ToolkitKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Encrypts SNS and SQS for ${AgentSpaceName}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchToPublishToEncryptedTopic
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowSNSToUseKey
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ToolkitKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AgentSpaceName}-toolkit'
+      TargetKeyId: !Ref ToolkitKey
+
+  # SNS topic that receives CloudWatch alarm notifications
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AgentSpaceName}-alarm-trigger'
+      DisplayName: DevOps Agent Alarm Trigger
+      KmsMasterKeyId: !Ref ToolkitKey
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          # Only CloudWatch may publish. This blocks IAM users and roles too,
+          # so nobody can push free text into the agent's prompt.
+          - Sid: DenyPublishExceptCloudWatch
+            Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringNotEquals:
+                aws:PrincipalServiceName: cloudwatch.amazonaws.com
+
+  # Dead letter queue for failed Lambda invocations
+  TriggerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AgentSpaceName}-trigger-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref ToolkitKey
+
+  # Lambda execution role
+  LambdaTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AgentSpaceName}-trigger-lambda-role'
+      Description: Execution role for the alarm-to-webhook Lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadHmacKey
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref HmacSecretArn
+        - PolicyName: UseToolkitKey
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt ToolkitKey.Arn
+              - !If
+                - HasSecretKmsKey
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref HmacSecretKmsKeyArn
+                - !Ref AWS::NoValue
+        - PolicyName: WriteDLQ
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt TriggerDLQ.Arn
+
+  TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AgentSpaceName}-alarm-trigger'
+      RetentionInDays: 30
+
+  # Lambda that signs alarms and forwards them to the webhook
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TriggerLogGroup
+    Properties:
+      FunctionName: !Sub '${AgentSpaceName}-alarm-trigger'
+      Description: Forwards CloudWatch alarms to DevOps Agent webhook with HMAC signing
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaTriggerRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt TriggerDLQ.Arn
+      Environment:
+        Variables:
+          HMAC_KEY_ARN: !Ref HmacSecretArn
+          WEBHOOK_URL: !Ref WebhookUrl
+      Code:
+        ZipFile: |
+          import json, boto3, os, hmac, hashlib, base64, logging
+          from datetime import datetime, timezone
+          from urllib import request
+
+          L = logging.getLogger()
+          L.setLevel(logging.INFO)
+
+          sm_client = boto3.client('secretsmanager')
+          _cached_hmac_key = None
+          MAX_TEXT = 1000
+
+          def get_hmac_key():
+              global _cached_hmac_key
+              if _cached_hmac_key is None:
+                  resp = sm_client.get_secret_value(SecretId=os.environ['HMAC_KEY_ARN'])
+                  _cached_hmac_key = resp['SecretString']
+              return _cached_hmac_key
+
+          def compute_signature(key, ts, payload):
+              msg = f"{ts}:{json.dumps(payload)}"
+              return base64.b64encode(
+                  hmac.new(key.encode(), msg.encode(), hashlib.sha256).digest()
+              ).decode()
+
+          def send(payload):
+              url = os.environ['WEBHOOK_URL']
+              key = get_hmac_key()
+              ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+              sig = compute_signature(key, ts, payload)
+              headers = {
+                  'Content-Type': 'application/json',
+                  'x-amzn-event-timestamp': ts,
+                  'x-amzn-event-signature': sig
+              }
+              req = request.Request(url, data=json.dumps(payload).encode(), headers=headers, method='POST')
+              with request.urlopen(req, timeout=25) as r:
+                  if r.status >= 300:
+                      raise RuntimeError(f"Webhook returned HTTP {r.status}")
+                  return r.status
+
+          def determine_priority(name, desc):
+              t = f"{name} {desc}".lower()
+              if any(w in t for w in ('critical', 'database', 'crash', 'fatal', 'outage')):
+                  return 'CRITICAL'
+              if any(w in t for w in ('error', '5xx', 'failure', 'dns', 'timeout', 'unhealthy')):
+                  return 'HIGH'
+              if any(w in t for w in ('latency', 'degraded', 'slow', 'warning')):
+                  return 'MEDIUM'
+              return 'HIGH'
+
+          def clip(v):
+              return str(v)[:MAX_TEXT]
+
+          def parse_alarm(msg, own_account):
+              # Only accept CloudWatch alarm JSON from this account. Anything else is dropped.
+              try:
+                  d = json.loads(msg)
+              except (ValueError, TypeError):
+                  return None, 'not JSON'
+              if not isinstance(d, dict):
+                  return None, 'not a JSON object'
+              for k in ('AlarmName', 'NewStateValue', 'AlarmArn', 'AWSAccountId'):
+                  if not isinstance(d.get(k), str) or not d.get(k):
+                      return None, f'missing {k}'
+              if d['AWSAccountId'] != own_account:
+                  return None, 'alarm from another account'
+              if not d['AlarmArn'].startswith('arn:aws') or f":cloudwatch:" not in d['AlarmArn'] \
+                      or f":{own_account}:alarm:" not in d['AlarmArn']:
+                  return None, 'AlarmArn is not a CloudWatch alarm in this account'
+              return d, ''
+
+          def handler(event, ctx):
+              own_account = ctx.invoked_function_arn.split(':')[4]
+              region = os.environ.get('AWS_REGION', 'unknown')
+              sent = 0
+              for rec in event.get('Records', []):
+                  msg = rec.get('Sns', {}).get('Message', '')
+                  d, why = parse_alarm(msg, own_account)
+                  if d is None:
+                      # Dropped on purpose. Do not log the message body.
+                      L.warning(f"Dropped SNS message {rec.get('Sns', {}).get('MessageId', '')}: {why}")
+                      continue
+                  if d['NewStateValue'] != 'ALARM':
+                      L.info(f"Skip non-ALARM state: {d['NewStateValue']}")
+                      continue
+
+                  name = clip(d['AlarmName'])
+                  desc = clip(d.get('AlarmDescription') or '')
+                  reason = clip(d.get('NewStateReason') or '')
+                  trig = d.get('Trigger') if isinstance(d.get('Trigger'), dict) else {}
+                  payload = {
+                      'eventType': 'incident',
+                      'incidentId': f"{name}-{ctx.aws_request_id}",
+                      'action': 'created',
+                      'priority': determine_priority(name, desc),
+                      'title': f"CloudWatch Alarm: {name}",
+                      'description': (
+                          f"Alarm '{name}' in {region}.\n"
+                          f"Description: {desc}\n"
+                          f"Reason: {reason}\n"
+                          f"Account: {own_account}\n"
+                          f"Region: {region}"
+                      ),
+                      'timestamp': clip(d.get('StateChangeTime') or datetime.now(timezone.utc).isoformat()),
+                      'service': 'cloudwatch',
+                      'data': {
+                          'alarmName': name, 'alarmArn': d['AlarmArn'], 'alarmDescription': desc,
+                          'newStateValue': 'ALARM', 'newStateReason': reason,
+                          'accountId': own_account, 'region': region,
+                          'trigger': {
+                              'metricName': clip(trig.get('MetricName', '')),
+                              'namespace': clip(trig.get('Namespace', '')),
+                              'statistic': clip(trig.get('Statistic', '')),
+                              'period': trig.get('Period', 0),
+                              'threshold': trig.get('Threshold', 0),
+                              'comparisonOperator': clip(trig.get('ComparisonOperator', '')),
+                              'dimensions': trig.get('Dimensions', [])
+                          }
+                      }
+                  }
+                  try:
+                      status = send(payload)
+                  except Exception as e:
+                      L.error(f"Send failed for alarm {name}: {e}")
+                      # Re-raise so Lambda retries and then sends the event to the DLQ.
+                      raise
+                  L.info(f"Sent: {status}")
+                  sent += 1
+              return {'statusCode': 200, 'body': json.dumps({'sent': sent})}
+
+  SNSInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlarmTopic
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: lambda
+      Endpoint: !GetAtt TriggerFunction.Arn
+
+  # Async retry settings: 2 retries, then the event goes to the DLQ
+  TriggerInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref TriggerFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 3600
+
+  # Goes to ALARM when a failed alarm lands in the DLQ
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AgentSpaceName}-trigger-dlq-not-empty'
+      AlarmDescription: Alarms that could not be sent to the DevOps Agent webhook are in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt TriggerDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasDlqAlarmAction
+        - [!Ref DlqAlarmActionArn]
+        - !Ref AWS::NoValue
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  AlarmSNSTopicArn:
+    Description: Add this ARN as an action on your CloudWatch Alarms
+    Value: !Ref AlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopicArn'
+
+  TriggerLambdaArn:
+    Description: Lambda function ARN
+    Value: !GetAtt TriggerFunction.Arn
+
+  HmacSecretArn:
+    Description: Secrets Manager ARN for the webhook HMAC key (created by you)
+    Value: !Ref HmacSecretArn
+
+  DLQDepthAlarmName:
+    Description: CloudWatch alarm that fires when the DLQ is not empty
+    Value: !Ref DLQDepthAlarm
+
+  DeadLetterQueueUrl:
+    Description: DLQ URL for failed invocations
+    Value: !Ref TriggerDLQ
+
+  LinkedBaseStack:
+    Description: The base install stack this add-on was deployed against
+    Value: !Ref BaseStackName
