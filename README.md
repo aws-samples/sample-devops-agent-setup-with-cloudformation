@@ -123,6 +123,8 @@ aws secretsmanager create-secret \
 rm hmac-key.txt
 ```
 
+Paste only the key, with no extra space or new line at the end. An extra character gives a 403 from the webhook.
+
 Copy the secret ARN. If you encrypt the secret with your own KMS key, also note the key ARN.
 
 Step 3 - deploy T2:
@@ -230,6 +232,10 @@ aws cloudformation deploy \
     AgentSpaceArn=<AGENT_SPACE_ARN_FROM_T1> \
   --region <REGION>
 ```
+
+If an IAM role with the same name already exists in this account (for example from an
+earlier test), the deploy fails with `ResourceExistenceCheck failed`. Delete the old role,
+or pass a new name with `RoleName=<NEW_ROLE_NAME>`.
 
 `AgentSpaceArn` is the `AgentSpaceArn` output of the T1 stack. The role trusts only that
 one Agent Space. Add `DenySensitiveReads=Yes` if you want the optional Deny (see Security).
